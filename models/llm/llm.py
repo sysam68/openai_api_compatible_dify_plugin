@@ -20,6 +20,7 @@ from dify_plugin.entities.model.message import (
     PromptMessageTool,
     SystemPromptMessage,
     AssistantPromptMessage,
+    TextPromptMessageContent,
 )
 from dify_plugin.errors.model import CredentialsValidateFailedError
 from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel
@@ -33,6 +34,49 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
     # Models that require max_completion_tokens (OpenAI Responses API family)
     _NEEDS_MAX_COMPLETION_TOKENS_PATTERN = re.compile(r"^(o1|o3|gpt-5)", re.IGNORECASE)
 
+    @staticmethod
+    def _coerce_content_piece(value: object) -> str:
+        """Normalize streaming/content values to text to avoid str/list concatenation errors."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            text_parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(str(item.get("text", "")))
+                    elif "content" in item:
+                        text_parts.append(OpenAILargeLanguageModel._coerce_content_piece(item.get("content")))
+                    else:
+                        text_parts.append(str(item))
+                else:
+                    text_parts.append(str(item))
+            return "".join(text_parts)
+        if isinstance(value, dict):
+            if value.get("type") == "text":
+                return str(value.get("text", ""))
+            if "content" in value:
+                return OpenAILargeLanguageModel._coerce_content_piece(value.get("content"))
+        return str(value)
+
+    @classmethod
+    def _prepend_structured_output_prompt(
+        cls, system_prompt: SystemPromptMessage, structured_output_prompt: str
+    ) -> None:
+        prefix = structured_output_prompt + "\n\n"
+        if isinstance(system_prompt.content, str) or system_prompt.content is None:
+            system_prompt.content = prefix + (system_prompt.content or "")
+            return
+
+        system_prompt.content = [
+            TextPromptMessageContent(data=prefix),
+            *system_prompt.content,
+        ]
+
     def _wrap_thinking_by_reasoning_content(self, delta: dict, is_reasoning: bool) -> tuple[str, bool]:
         """
         Override base wrapper to support both legacy 'reasoning_content' and
@@ -40,8 +84,8 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         compatible with Dify's downstream filters.
         """
         # Prefer the new key when present, otherwise fall back to legacy
-        reasoning_piece = delta.get("reasoning") or delta.get("reasoning_content")
-        content_piece = delta.get("content") or ""
+        reasoning_piece = self._coerce_content_piece(delta.get("reasoning") or delta.get("reasoning_content"))
+        content_piece = self._coerce_content_piece(delta.get("content"))
 
         if reasoning_piece:
             if not is_reasoning:
@@ -371,9 +415,7 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
                     (p for p in prompt_messages if p.role == PromptMessageRole.SYSTEM), None
                 )
                 if existing_system_prompt:
-                    existing_system_prompt.content = (
-                        structured_output_prompt + "\n\n" + existing_system_prompt.content
-                    )
+                    self._prepend_structured_output_prompt(existing_system_prompt, structured_output_prompt)
                 else:
                     prompt_messages.insert(0, SystemPromptMessage(content=structured_output_prompt))
 
