@@ -1,10 +1,12 @@
+import codecs
 import json
 import re
 from contextlib import suppress
-from typing import Mapping, Optional, Union, Generator, List
+from typing import Any, Mapping, Optional, Union, Generator, List
 from urllib.parse import urljoin
 
 import requests
+from pydantic import TypeAdapter, ValidationError
 from dify_plugin.entities.model import (
     AIModelEntity,
     DefaultParameterName,
@@ -14,6 +16,7 @@ from dify_plugin.entities.model import (
     ParameterType,
 )
 from dify_plugin.entities.model.llm import LLMMode, LLMResult
+from dify_plugin.entities.model.llm import LLMResultChunk, LLMResultChunkDelta
 from dify_plugin.entities.model.message import (
     PromptMessage,
     PromptMessageRole,
@@ -23,7 +26,7 @@ from dify_plugin.entities.model.message import (
     TextPromptMessageContent,
 )
 from dify_plugin.errors.model import CredentialsValidateFailedError
-from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel
+from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel, _increase_tool_call
 
 from openai import OpenAI
 
@@ -522,7 +525,8 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         
         for chunk in stream:
             if chunk.delta and chunk.delta.message and chunk.delta.message.content:
-                content = chunk.delta.message.content
+                content = self._coerce_content_piece(chunk.delta.message.content)
+                chunk.delta.message.content = content
                 buffer += content
                 
                 # Detect start of thinking block
@@ -556,3 +560,182 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             else:
                 # Yield chunks without content as-is
                 yield chunk
+
+    def _handle_generate_stream_response(
+        self, model: str, credentials: dict, response: requests.Response, prompt_messages: list[PromptMessage]
+    ) -> Generator:
+        """
+        Normalize streamed content fragments before the SDK base class can concatenate
+        them as strings. Some OpenAI-compatible providers return `delta.content` or
+        `text` as structured lists instead of plain strings.
+        """
+        chunk_index = 0
+        full_assistant_content = ""
+        tools_calls: list[AssistantPromptMessage.ToolCall] = []
+        finish_reason = None
+        usage = None
+        is_reasoning_started = False
+        delimiter = credentials.get("stream_mode_delimiter", "\n\n")
+        delimiter = codecs.decode(delimiter, "unicode_escape")
+
+        for chunk in response.iter_lines(decode_unicode=True, delimiter=delimiter):
+            chunk = chunk.strip()
+            if not chunk:
+                chunk_index += 1
+                continue
+            if chunk.startswith(":"):
+                continue
+
+            decoded_chunk = chunk.strip().removeprefix("data:").lstrip()
+            if decoded_chunk == "[DONE]":
+                continue
+
+            try:
+                chunk_json: dict = TypeAdapter(dict[str, Any]).validate_json(decoded_chunk)
+            except ValidationError:
+                yield self._create_final_llm_result_chunk(
+                    index=chunk_index + 1,
+                    message=AssistantPromptMessage(content=""),
+                    finish_reason="Non-JSON encountered.",
+                    usage=usage,
+                    model=model,
+                    credentials=credentials,
+                    prompt_messages=prompt_messages,
+                    full_content=full_assistant_content,
+                )
+                break
+
+            if chunk_json.get("error") and chunk_json.get("choices") is None:
+                raise ValueError(chunk_json.get("error"))
+
+            if chunk_json and (u := chunk_json.get("usage")):
+                usage = u
+            if not chunk_json or len(chunk_json["choices"]) == 0:
+                continue
+
+            choice = chunk_json["choices"][0]
+            finish_reason = chunk_json["choices"][0].get("finish_reason")
+            chunk_index += 1
+
+            if "delta" in choice:
+                delta = dict(choice["delta"])
+                if "content" in delta:
+                    delta["content"] = self._coerce_content_piece(delta.get("content"))
+                if "reasoning" in delta:
+                    delta["reasoning"] = self._coerce_content_piece(delta.get("reasoning"))
+                if "reasoning_content" in delta:
+                    delta["reasoning_content"] = self._coerce_content_piece(delta.get("reasoning_content"))
+
+                delta_content, is_reasoning_started = self._wrap_thinking_by_reasoning_content(
+                    delta, is_reasoning_started
+                )
+
+                assistant_message_tool_calls = None
+                if "tool_calls" in delta and credentials.get("function_calling_type", "no_call") == "tool_call":
+                    assistant_message_tool_calls = delta.get("tool_calls", None)
+                elif (
+                    "function_call" in delta
+                    and credentials.get("function_calling_type", "no_call") == "function_call"
+                ):
+                    assistant_message_tool_calls = [
+                        {"id": "tool_call_id", "type": "function", "function": delta.get("function_call", {})}
+                    ]
+
+                if assistant_message_tool_calls:
+                    tool_calls = self._extract_response_tool_calls(assistant_message_tool_calls)
+                    _increase_tool_call(tool_calls, tools_calls)
+
+                if not delta_content:
+                    continue
+
+                assistant_prompt_message = AssistantPromptMessage(content=delta_content)
+                full_assistant_content += delta_content
+            elif "text" in choice:
+                choice_text = self._coerce_content_piece(choice.get("text"))
+                if not choice_text:
+                    continue
+
+                assistant_prompt_message = AssistantPromptMessage(content=choice_text)
+                full_assistant_content += choice_text
+            else:
+                continue
+
+            yield LLMResultChunk(
+                model=model,
+                delta=LLMResultChunkDelta(
+                    index=chunk_index,
+                    message=assistant_prompt_message,
+                ),
+            )
+
+            chunk_index += 1
+
+        if tools_calls:
+            yield LLMResultChunk(
+                model=model,
+                delta=LLMResultChunkDelta(
+                    index=chunk_index,
+                    message=AssistantPromptMessage(tool_calls=tools_calls, content=""),
+                ),
+            )
+
+        yield self._create_final_llm_result_chunk(
+            index=chunk_index,
+            message=AssistantPromptMessage(content=""),
+            finish_reason=finish_reason,
+            usage=usage,
+            model=model,
+            credentials=credentials,
+            prompt_messages=prompt_messages,
+            full_content=full_assistant_content,
+        )
+
+    def _handle_generate_response(
+        self,
+        model: str,
+        credentials: dict,
+        response: requests.Response,
+        prompt_messages: list[PromptMessage],
+    ) -> LLMResult:
+        response_json: dict = response.json()
+
+        completion_type = LLMMode.value_of(credentials["mode"])
+        output = response_json["choices"][0]
+        message_id = response_json.get("id")
+
+        response_content = ""
+        tool_calls = None
+        function_calling_type = credentials.get("function_calling_type", "no_call")
+        if completion_type is LLMMode.CHAT:
+            response_content = self._coerce_content_piece(output.get("message", {}).get("content"))
+            if function_calling_type == "tool_call":
+                tool_calls = output.get("message", {}).get("tool_calls")
+            elif function_calling_type == "function_call":
+                tool_calls = output.get("message", {}).get("function_call")
+        elif completion_type is LLMMode.COMPLETION:
+            response_content = self._coerce_content_piece(output.get("text"))
+
+        assistant_message = AssistantPromptMessage(content=response_content, tool_calls=[])
+
+        if tool_calls:
+            if function_calling_type == "tool_call":
+                assistant_message.tool_calls = self._extract_response_tool_calls(tool_calls)
+            elif function_calling_type == "function_call":
+                assistant_message.tool_calls = [self._extract_response_function_call(tool_calls)]
+
+        usage = response_json.get("usage")
+        if usage:
+            prompt_tokens = usage["prompt_tokens"]
+            completion_tokens = usage["completion_tokens"]
+        else:
+            prompt_tokens = self._num_tokens_from_messages(prompt_messages, credentials=credentials)
+            completion_tokens = self._num_tokens_from_string(assistant_message.content or "")
+
+        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
+
+        return LLMResult(
+            id=message_id,
+            model=response_json.get("model", model),
+            message=assistant_message,
+            usage=usage,
+        )

@@ -1,4 +1,10 @@
-from dify_plugin.entities.model.message import SystemPromptMessage, TextPromptMessageContent
+from dify_plugin.entities.model.llm import LLMMode
+from dify_plugin.entities.model.message import (
+    AssistantPromptMessage,
+    SystemPromptMessage,
+    TextPromptMessageContent,
+    UserPromptMessage,
+)
 
 from models.llm.llm import OpenAILargeLanguageModel
 
@@ -96,3 +102,73 @@ def test_prepend_structured_output_prompt_preserves_multimodal_system_prompt():
     assert len(system_prompt.content) == 2
     assert system_prompt.content[0].data == "Return valid JSON.\n\n"
     assert system_prompt.content[1].data == "Existing system prompt."
+
+
+class _DummyStreamResponse:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def iter_lines(self, decode_unicode=True, delimiter="\n\n"):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _DummyJSONResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_handle_generate_stream_response_coerces_list_delta_content():
+    model = OpenAILargeLanguageModel(model_schemas=[])
+    response = _DummyStreamResponse(
+        [
+            'data: {"choices":[{"delta":{"content":[{"type":"text","text":"Hello"}]}}]}',
+            'data: {"choices":[{"delta":{"content":[{"type":"text","text":" world"}]},"finish_reason":"stop"}]}',
+        ]
+    )
+
+    chunks = list(
+        model._handle_generate_stream_response(
+            "gpt-4o",
+            {"mode": LLMMode.CHAT.value},
+            response,
+            [UserPromptMessage(content="prompt")],
+        )
+    )
+
+    assert chunks[0].delta.message.content == "Hello"
+    assert chunks[1].delta.message.content == " world"
+    assert chunks[-1].delta.finish_reason == "stop"
+
+
+def test_handle_generate_response_coerces_list_message_content():
+    model = OpenAILargeLanguageModel(model_schemas=[])
+    response = _DummyJSONResponse(
+        {
+            "id": "resp_1",
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Hello"},
+                            {"type": "text", "text": " world"},
+                        ]
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+    )
+
+    result = model._handle_generate_response(
+        "gpt-4o",
+        {"mode": LLMMode.CHAT.value},
+        response,
+        [UserPromptMessage(content="prompt")],
+    )
+
+    assert result.message.content == "Hello world"
